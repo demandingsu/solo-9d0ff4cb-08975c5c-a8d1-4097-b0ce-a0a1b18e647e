@@ -1,0 +1,8 @@
+{
+  "name": "堤防 K 线（示例）",
+  "segments": [
+    {"segment_id": "S1", "start": [0, 0], "end": [100, 0], "start_station": 0, "end_station": 100},
+    {"segment_id": "S2", "start": [100, 0], "end": [200, 0], "start_station": 90, "end_station": 190},
+    {"segment_id": "S3", "start": [200, 0], "end": [300, 0], "start_station": 240, "end_station": 340}
+  ]
+}

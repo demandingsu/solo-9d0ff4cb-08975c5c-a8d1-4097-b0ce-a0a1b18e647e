@@ -1,0 +1,9 @@
+{
+  "records": [
+    {"station": 50},
+    {"station": 95},
+    {"station": 95, "segment_id": "S2"},
+    {"station": 160},
+    {"station": 250}
+  ]
+}

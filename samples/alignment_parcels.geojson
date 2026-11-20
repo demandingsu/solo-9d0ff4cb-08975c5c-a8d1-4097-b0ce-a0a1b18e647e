@@ -1,0 +1,11 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type": "Feature", "properties": {"parcel_id": "K1"},
+     "geometry": {"type": "Polygon", "coordinates": [[[0, -20], [120, -20], [120, 20], [0, 20], [0, -20]]]}},
+    {"type": "Feature", "properties": {"parcel_id": "K2"},
+     "geometry": {"type": "Polygon", "coordinates": [[[120, -20], [220, -20], [220, 20], [120, 20], [120, -20]]]}},
+    {"type": "Feature", "properties": {"parcel_id": "K3"},
+     "geometry": {"type": "Polygon", "coordinates": [[[220, -20], [300, -20], [300, 20], [220, 20], [220, -20]]]}}
+  ]
+}

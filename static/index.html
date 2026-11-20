@@ -57,6 +57,7 @@
       <button id="tabImport" class="active" onclick="showTab('import')">导入</button>
       <button id="tabChange" onclick="showTab('change')">变更</button>
       <button id="tabQuery" onclick="showTab('query')">查询</button>
+      <button id="tabInspect" onclick="showTab('inspect')">巡检</button>
     </div>
 
     <!-- 导入 -->
@@ -105,6 +106,39 @@
       <div id="txnList"></div>
       <div id="txnDetail"></div>
     </section>
+
+    <!-- 巡检 -->
+    <section id="paneInspect" class="hidden">
+      <h2>线路（按行进顺序相接的直线段）</h2>
+      <p class="muted">每段填写段号、地籍坐标系下的起止坐标、递增的起止桩号；相邻段共用端点。
+        桩号允许回跳（后段起桩号可小于前段止桩号），因此同一桩号可能指向多处。</p>
+      <label>线路名称</label>
+      <input type="text" id="alignName" placeholder="例如：堤防 K 线">
+      <label style="margin-top:8px">段列表（JSON 数组）</label>
+      <textarea id="segmentsText" style="min-height:130px" placeholder='[{"segment_id":"S1","start":[0,0],"end":[100,0],"start_station":0,"end_station":100}, ...]'></textarea>
+      <button class="action" onclick="createAlignment()">上传线路</button>
+      <div id="alignMsg"></div>
+
+      <h2>选择线路</h2>
+      <select id="alignSelect" onchange="selectAlignment()" style="width:100%;padding:7px;border:1px solid #b6c2cf;border-radius:6px"></select>
+
+      <h2>巡检记录（按实地先后）</h2>
+      <p class="muted">每笔一个桩号，可选填写所在段。导入后追加到所选线路。</p>
+      <textarea id="recordsText" style="min-height:90px" placeholder='[{"station":50},{"station":95,"segment_id":"S2"}, ...]'></textarea>
+      <button class="action" onclick="importInspections()">导入巡检记录</button>
+      <div id="inspMsg"></div>
+
+      <h2>结果</h2>
+      <div class="row">
+        <label style="flex:0 0 auto;margin:0;line-height:28px">地籍版本</label>
+        <input type="number" id="mapVersion" min="0" placeholder="留空=当前版本" style="flex:1">
+        <button class="action" style="width:90px;margin-top:0" onclick="runEvaluate()">重新定位</button>
+      </div>
+      <p class="muted" id="mapVerHint"></p>
+      <div id="evalMsg"></div>
+      <div id="evalSummary"></div>
+      <div id="evalList"></div>
+    </section>
   </div>
 
   <div class="panel" style="padding:10px">
@@ -117,6 +151,9 @@
       <span><i class="swatch" style="background:#fb8c00"></i>侵占</span>
       <span><i class="swatch" style="background:#8e24aa"></i>越界</span>
       <span><i class="swatch" style="background:#d81b60"></i>新面互叠</span>
+      <span><i class="swatch" style="background:#455a64"></i>线路段</span>
+      <span><i class="swatch" style="background:#00897b"></i>唯一落点</span>
+      <span><i class="swatch" style="background:#ffb300"></i>待确认候选</span>
     </div>
   </div>
 </div>
@@ -127,7 +164,7 @@ let state = { version: 0, parcels: [] };
 let lastPlan = null;
 
 function showTab(name) {
-  for (const t of ["Import", "Change", "Query"]) {
+  for (const t of ["Import", "Change", "Query", "Inspect"]) {
     document.getElementById("pane" + t).classList.toggle("hidden", t.toLowerCase() !== name);
     document.getElementById("tab" + t).classList.toggle("active", t.toLowerCase() === name);
   }
@@ -142,7 +179,11 @@ function setMsg(id, cls, text) {
 async function api(path, opts) {
   const resp = await fetch(path, opts);
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+  if (!resp.ok) {
+    const err = new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -165,6 +206,22 @@ function allRings(features) {
   return rings;
 }
 
+// 线路段 / 落点同样参与自动取景
+function allOutlinePoints(features) {
+  const pts = [];
+  for (const f of features) {
+    const g = f.geometry || f;
+    if (g.type === "LineString") g.coordinates.forEach(p => pts.push(p));
+  }
+  return pts;
+}
+
+function collectPointMarkers(overlays) {
+  const pts = [];
+  (overlays || []).forEach(o => { if (o.kind === "points") pts.push(...(o.points || [])); });
+  return pts;
+}
+
 function renderMap(overlays) {
   const svg = document.getElementById("map");
   svg.innerHTML = "";
@@ -172,7 +229,9 @@ function renderMap(overlays) {
   const ovFeats = [];
   (overlays || []).forEach(o => (o.features || []).forEach(f => ovFeats.push(f)));
   const rings = allRings(feats).concat(allRings(ovFeats));
-  if (!rings.length) {
+  const marks = collectPointMarkers(overlays);
+  const linePts = allOutlinePoints(ovFeats);
+  if (!rings.length && !marks.length && !linePts.length) {
     const t = document.createElementNS(SVG_NS, "text");
     t.setAttribute("x", 20); t.setAttribute("y", 30); t.setAttribute("fill", "#7b8794");
     t.textContent = "暂无数据，请先导入 GeoJSON 宗地";
@@ -180,10 +239,13 @@ function renderMap(overlays) {
     return;
   }
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  rings.forEach(ring => ring.forEach(([x, y]) => {
+  const spread = ([x, y]) => {
     minX = Math.min(minX, x); minY = Math.min(minY, y);
     maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
-  }));
+  };
+  rings.forEach(ring => ring.forEach(spread));
+  linePts.forEach(spread);
+  marks.forEach(m => spread([m.x, m.y]));
   const w = svg.clientWidth || 800, h = svg.clientHeight || 600;
   const pad = 40;
   const scale = Math.min((w - pad * 2) / Math.max(maxX - minX, 1), (h - pad * 2) / Math.max(maxY - minY, 1));
@@ -222,7 +284,40 @@ function renderMap(overlays) {
     addLabel(f.geometry, f.parcel_id);
   });
   for (const layer of (overlays || [])) {
+    if (layer.kind === "points") {
+      for (const m of layer.points || []) {
+        const [cx, cy] = tx([m.x, m.y]);
+        const dot = document.createElementNS(SVG_NS, "circle");
+        dot.setAttribute("cx", cx); dot.setAttribute("cy", cy); dot.setAttribute("r", m.fixed ? 5 : 4);
+        dot.setAttribute("fill", m.color); dot.setAttribute("stroke", "#fff"); dot.setAttribute("stroke-width", 1.5);
+        svg.appendChild(dot);
+        const t = document.createElementNS(SVG_NS, "text");
+        t.setAttribute("x", cx + 7); t.setAttribute("y", cy - 6);
+        t.setAttribute("font-size", 11); t.setAttribute("fill", m.color);
+        t.textContent = m.label + (m.parcels && m.parcels.length ? "（" + m.parcels.join("、") + "）" : "");
+        svg.appendChild(t);
+      }
+      continue;
+    }
     for (const f of layer.features) {
+      if (f.geometry.type === "LineString") {
+        const el = document.createElementNS(SVG_NS, "polyline");
+        el.setAttribute("points", f.geometry.coordinates.map(p => tx(p).join(",")).join(" "));
+        el.setAttribute("fill", "none");
+        el.setAttribute("stroke", layer.stroke || layer.color);
+        el.setAttribute("stroke-width", 3);
+        el.setAttribute("stroke-opacity", layer.opacity ?? 0.9);
+        svg.appendChild(el);
+        const mid = f.geometry.coordinates[Math.floor(f.geometry.coordinates.length / 2)];
+        const [lx, ly] = tx(mid);
+        const t = document.createElementNS(SVG_NS, "text");
+        t.setAttribute("x", lx); t.setAttribute("y", ly - 6);
+        t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", 11);
+        t.setAttribute("fill", layer.stroke || layer.color);
+        t.textContent = f.label || "";
+        svg.appendChild(t);
+        continue;
+      }
       addPolygon(f.geometry, { fill: layer.color, stroke: layer.stroke || layer.color, "stroke-width": 1.2, "fill-opacity": layer.opacity ?? 0.55 });
       if (f.label) addLabel(f.geometry, f.label, layer.stroke || layer.color);
     }
@@ -368,7 +463,229 @@ async function loadTxn(id) {
   } catch (e) { document.getElementById("txnDetail").innerHTML = `<div class="msg err">${e.message}</div>`; }
 }
 
+/* ---------- 巡检：线路 / 桩号定位 ---------- */
+let currentAlignment = null;
+let currentEval = null;
+
+async function loadAlignments() {
+  try {
+    const r = await api("/api/alignments");
+    const sel = document.getElementById("alignSelect");
+    const before = currentAlignment;
+    sel.innerHTML = r.alignments.map(a =>
+      `<option value="${a.alignment_id}">#${a.alignment_id} ${a.name}（${a.segment_count} 段）</option>`).join("")
+      || '<option value="">暂无线路，请先上传</option>';
+    if (!r.alignments.length) return;
+    const ids = r.alignments.map(a => a.alignment_id);
+    // 尽量保持当前选择；首次进入默认选最新上传的一条
+    currentAlignment = ids.includes(before) ? before : ids[ids.length - 1];
+    sel.value = currentAlignment;
+    await runEvaluate();
+  } catch (e) { /* 未影响主流程 */ }
+}
+
+async function selectAlignment() {
+  currentAlignment = parseInt(document.getElementById("alignSelect").value, 10) || null;
+  currentEval = null;
+  document.getElementById("evalList").innerHTML = "";
+  document.getElementById("evalSummary").innerHTML = "";
+  setMsg("evalMsg", "");
+  if (currentAlignment) await runEvaluate();
+}
+
+async function createAlignment() {
+  setMsg("alignMsg", "");
+  let segments;
+  try { segments = JSON.parse(document.getElementById("segmentsText").value); }
+  catch (e) { return setMsg("alignMsg", "err", "段列表 JSON 解析失败：" + e.message); }
+  if (!Array.isArray(segments)) return setMsg("alignMsg", "err", "段列表必须是 JSON 数组");
+  try {
+    const r = await api("/api/alignments", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: document.getElementById("alignName").value, segments }),
+    });
+    setMsg("alignMsg", "ok", `线路 #${r.alignment_id} 已上传，共 ${r.segments.length} 段`);
+    currentAlignment = r.alignment_id;
+    await loadAlignments();
+    document.getElementById("alignSelect").value = currentAlignment;
+    await runEvaluate();
+  } catch (e) { setMsg("alignMsg", "err", e.message); }
+}
+
+async function importInspections() {
+  setMsg("inspMsg", "");
+  if (!currentAlignment) return setMsg("inspMsg", "warn", "请先上传或选择线路");
+  let records;
+  try { records = JSON.parse(document.getElementById("recordsText").value); }
+  catch (e) { return setMsg("inspMsg", "err", "记录 JSON 解析失败：" + e.message); }
+  if (!Array.isArray(records)) return setMsg("inspMsg", "err", "记录必须是 JSON 数组");
+  try {
+    const r = await api(`/api/alignments/${currentAlignment}/inspections`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ records }),
+    });
+    setMsg("inspMsg", "ok", `已导入 ${r.imported} 笔记录`);
+    await loadAlignments();
+  } catch (e) { setMsg("inspMsg", "err", e.message); }
+}
+
+async function runEvaluate() {
+  if (!currentAlignment) return;
+  setMsg("evalMsg", "");
+  const vRaw = document.getElementById("mapVersion").value.trim();
+  const v = vRaw === "" ? null : parseInt(vRaw, 10);
+  const qs = v === null || isNaN(v) ? "" : "?version=" + v;
+  try {
+    const r = await api(`/api/alignments/${currentAlignment}/evaluate${qs}`, { method: "POST" });
+    currentEval = r;
+    renderEval(r);
+  } catch (e) {
+    setMsg("evalMsg", "err", e.message);
+  }
+}
+
+function candidateText(c) {
+  return `${c.label} @ (${c.point[0]}, ${c.point[1]})`;
+}
+
+function renderEval(r, preservedNote) {
+  document.getElementById("mapVerHint").textContent =
+    `落图地籍版本：v${r.map_version}（当前 v${r.current_version}）`;
+  const list = document.getElementById("evalList");
+  const summary = document.getElementById("evalSummary");
+  if (!r.ok) {
+    summary.innerHTML = "";
+    setMsg("evalMsg", "err",
+      "整批无解，未落图：" + (r.reason || "原因未知") +
+      (preservedNote || "\n记录与落图保持补正前状态，可更正所在段后重试。"));
+    // 无解时仍逐笔列出记录与原始候选（不落图），便于直接补正
+    list.innerHTML = renderRecordTable(r, false);
+    renderInspectionMap(r);
+    return;
+  }
+  const need = r.records.filter(x => x.needs_confirmation).length;
+  const located = r.records.filter(x => x.unique).length;
+  summary.innerHTML =
+    `<div style="margin:6px 0">` +
+    `<span class="pill" style="background:#eaf6ec;color:#1e6b29">唯一落点 ${located}</span> ` +
+    `<span class="pill" style="background:#fff7e6;color:#8a5a00">待确认 ${need}</span></div>`;
+  if (preservedNote) setMsg("evalMsg", "warn", preservedNote);
+
+  list.innerHTML = renderRecordTable(r, true);
+  renderInspectionMap(r);
+}
+
+// 逐笔表格：ok=false 时列原始候选并标注整批无解，且不给出唯一落点
+function renderRecordTable(r, ok) {
+  const opts = (rec) => {
+    const items = [];
+    for (const s of (r.segments || [])) {
+      if (rec.station < Math.min(s.start_station, s.end_station) ||
+          rec.station > Math.max(s.start_station, s.end_station)) continue;
+      const t = (rec.station - s.start_station) / (s.end_station - s.start_station);
+      const x = s.start[0] + (s.end[0] - s.start[0]) * t;
+      const y = s.start[1] + (s.end[1] - s.start[1]) * t;
+      const sel = rec.segment_id === s.segment_id ? " selected" : "";
+      items.push(`<option value="${s.segment_id}"${sel}>${s.segment_id} @ (${x}, ${y})</option>`);
+    }
+    return `<select data-insp="${rec.inspection_id}" onchange="correctInspection(this)">
+        <option value="">— ${rec.segment_id ? "清除所填" : "尚需确认"} —</option>
+        ${items.join("")}
+      </select>`;
+  };
+  const rows = (r.records || []).map(rec => {
+    const shown = ok ? rec.candidates : (rec.raw_candidates || []);
+    const cands = shown.length
+      ? shown.map(candidateText).join("<br>")
+      : '<span class="muted">无几何候选</span>';
+    const loc = !ok
+      ? `<span style="color:#a3261c">整批无解，不落图</span>`
+      : rec.unique
+        ? `<b style="color:#00695c">${rec.located_segment} @ (${rec.point[0]}, ${rec.point[1]})</b><br>
+           <span class="muted">覆盖宗地：${rec.parcels.length ? rec.parcels.join("、") : "无"}</span>`
+        : `<span class="muted">需确认（${rec.candidates.length} 处候选）</span>`;
+    const chosen = rec.segment_id ? `已定 ${rec.segment_id}` : "未填";
+    return `<tr><td>${rec.index + 1}</td><td>${rec.station}</td><td>${cands}</td><td>${loc}</td>
+            <td><span class="muted">${chosen}</span><br>${opts(rec)}</td></tr>`;
+  }).join("");
+  return `<table><tr><th>#</th><th>桩号</th><th>候选段 @ 坐标</th><th>定位结果</th><th>补填/更正所在段</th></tr>${rows}</table>`;
+}
+
+async function correctInspection(sel) {
+  const id = parseInt(sel.getAttribute("data-insp"), 10);
+  const seg = sel.value || null;
+  const vRaw = document.getElementById("mapVersion").value.trim();
+  const v = vRaw === "" ? null : parseInt(vRaw, 10);
+  const qs = v === null || isNaN(v) ? "" : "?version=" + v;
+  try {
+    const r = await api(`/api/inspections/${id}${qs}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ segment_id: seg }),
+    });
+    setMsg("inspMsg", "ok",
+      `记录 #${id} 所在段 ${r.correction.old_segment_id || "（空）"} → ${r.correction.new_segment_id || "（空）"}，已联动重算`);
+    currentEval = r;
+    renderEval(r);
+  } catch (e) {
+    if (e.data && e.data.preserved) {
+      // 补正后整批无解：保留补正前的记录与落图
+      currentEval = e.data.preserved;
+      renderEval(e.data.preserved,
+        e.message + "\n补正未写入，以下仍是补正前的记录与落图。");
+    } else {
+      setMsg("evalMsg", "err", e.message);
+    }
+    await reloadInspectionRecords();
+  }
+}
+
+// 补正失败时从库中重读记录，确认网页上的段号与库内一致
+async function reloadInspectionRecords() {
+  if (!currentAlignment) return null;
+  try {
+    return await api(`/api/alignments/${currentAlignment}`);
+  } catch (_) { return null; }
+}
+
+function renderInspectionMap(r) {
+  const layers = [];
+  // 线路段：标出段号与桩号区间
+  const segFeats = (r.segments || []).map(s => ({
+    geometry: { type: "LineString", coordinates: [s.start, s.end] },
+    label: `${s.segment_id} [${s.start_station}→${s.end_station}]`,
+  }));
+  if (segFeats.length) {
+    layers.push({ color: "#455a64", stroke: "#263238", opacity: 0.9, features: segFeats });
+  }
+  // 位置唯一的记录才落点；待确认的候选只以空心提示，供资料员判断
+  const pts = [];
+  for (const rec of r.records || []) {
+    if (rec.unique && rec.point) {
+      pts.push({
+        x: rec.point[0], y: rec.point[1],
+        label: `#${rec.index + 1} ${rec.located_segment} ${rec.station}`,
+        color: "#00897b", fixed: true, parcels: rec.parcels || [],
+      });
+    }
+    if (!r.ok) continue; // 无解批次不落候选点，保留补正前的落图
+    for (const c of rec.candidates || []) {
+      if (rec.unique) continue;
+      pts.push({ x: c.point[0], y: c.point[1], label: `#${rec.index + 1} ${c.label}?`, color: "#ffb300", fixed: false });
+    }
+  }
+  layers.push({ kind: "points", points: pts });
+  // 地图底图使用所选地籍版本快照，使覆盖宗地与落点同源
+  const saved = state.parcels;
+  if (Array.isArray(r.map_parcels)) {
+    state.parcels = r.map_parcels.map(p => ({ parcel_id: p.parcel_id, geometry: p.geometry }));
+  }
+  renderMap(layers);
+  state.parcels = saved;
+}
+
+
 refreshState().catch(() => {});
+loadAlignments();
 </script>
 </body>
 </html>
